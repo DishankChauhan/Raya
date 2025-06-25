@@ -41,7 +41,7 @@ An intelligent Anti-Money Laundering (AML) system that detects suspicious transa
 
 ### 1. Clone and Setup
 ```bash
-git clone <repository>
+git clone https://github.com/DishankChauhan/Raya
 cd aml-guard
 ```
 
