@@ -77,6 +77,12 @@ class FlaggedTransaction(db.Model):
     assigned_to = db.Column(db.String(100))
     notes = db.Column(db.Text)
     
+    # Analyst Review (Phase 3)
+    analyst_verdict = db.Column(db.String(30), default='Unreviewed') # Unreviewed, True Positive, False Positive
+    analyst_notes = db.Column(db.Text)
+    analyst_reviewed_at = db.Column(db.DateTime)
+    analyst_reviewed_by = db.Column(db.String(100))
+
     # AI/LLM analysis results (Phase 2)
     llm_risk_level = db.Column(db.String(10))  # High, Medium, Low
     llm_explanation = db.Column(db.Text)  # LLM-generated explanation

@@ -13,7 +13,12 @@ logger = logging.getLogger(__name__)
 
 class LLMRiskClassifier:
     def __init__(self, api_key: Optional[str] = None):
-        self.client = openai.OpenAI(api_key=api_key or Config.OPENAI_API_KEY)
+        # Configure the OpenAI client with automatic retries
+        self.client = openai.OpenAI(
+            api_key=api_key or Config.OPENAI_API_KEY,
+            max_retries=3,  # Max 3 retries on transient errors
+            timeout=30  # 30-second timeout
+        )
         self.model = "gpt-4-1106-preview"  # GPT-4 Turbo with function calling
         
     def analyze_transaction_risk(self, transaction_id: str, flagged_transaction_id: str) -> Dict:

@@ -54,6 +54,90 @@ def create_app(config_name=None):
             }
         })
     
+    @app.route('/dashboard')
+    def dashboard():
+        """Serve the analyst review dashboard"""
+        page = request.args.get('page', 1, type=int)
+        per_page = 50
+        
+        # Base query to get flagged transactions
+        query = db.session.query(FlaggedTransaction).options(
+            db.joinedload(FlaggedTransaction.transaction).joinedload(Transaction.sender)
+        ).order_by(FlaggedTransaction.flagged_at.desc())
+        
+        # Paginate the results
+        pagination = query.paginate(page=page, per_page=per_page, error_out=False)
+        flags = pagination.items
+
+        # We need to structure the data for the template
+        flagged_transactions_data = []
+        for flag in flags:
+            transaction_data = {
+                'flag_id': str(flag.id),
+                'rule_name': flag.rule_name,
+                'risk_level': flag.risk_level,
+                'risk_score': flag.risk_score,
+                'status': flag.status,
+                'flagged_at': flag.flagged_at.strftime('%Y-%m-%d %H:%M:%S'),
+                'analyst_verdict': flag.analyst_verdict,
+                'analyst_notes': flag.analyst_notes,
+                'analyst_reviewed_at': flag.analyst_reviewed_at.strftime('%Y-%m-%d %H:%M:%S') if flag.analyst_reviewed_at else 'N/A',
+                'analyst_reviewed_by': flag.analyst_reviewed_by or 'N/A',
+                'transaction': {
+                    'amount': float(flag.transaction.amount),
+                    'currency': flag.transaction.currency,
+                    'counterparty_name': flag.transaction.counterparty_name,
+                    'counterparty_country': flag.transaction.counterparty_country,
+                },
+                'customer': {
+                    'name': flag.transaction.sender.name,
+                    'account_number': flag.transaction.sender.account_number,
+                }
+            }
+            if flag.llm_analyzed_at:
+                transaction_data['llm_analysis'] = {
+                    'risk_level': flag.llm_risk_level,
+                    'explanation': flag.llm_explanation,
+                    'suggested_action': flag.llm_suggested_action,
+                    'confidence_score': flag.llm_confidence_score,
+                }
+            flagged_transactions_data.append(transaction_data)
+
+        return render_template(
+            'dashboard.html', 
+            flags=flagged_transactions_data,
+            pagination=pagination
+        )
+
+    @app.route('/api/flagged/<flag_id>/review', methods=['POST'])
+    def review_flagged_transaction(flag_id):
+        """Endpoint for analysts to submit their review"""
+        data = request.get_json()
+        if not data:
+            return jsonify({'success': False, 'error': 'Invalid request'}), 400
+
+        verdict = data.get('verdict')
+        notes = data.get('notes')
+        analyst = data.get('analyst')
+
+        flag = FlaggedTransaction.query.get(flag_id)
+        if not flag:
+            return jsonify({'success': False, 'error': 'Flagged transaction not found'}), 404
+
+        try:
+            flag.analyst_verdict = verdict
+            flag.analyst_notes = notes
+            flag.analyst_reviewed_by = analyst
+            flag.analyst_reviewed_at = datetime.utcnow()
+            flag.status = 'reviewed' # Update status
+            
+            db.session.commit()
+            
+            return jsonify({'success': True, 'message': 'Review submitted successfully'})
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({'success': False, 'error': str(e)}), 500
+
     @app.route('/api/flagged', methods=['GET'])
     def get_flagged_transactions():
         """Get all flagged transactions with filtering options and LLM analysis"""

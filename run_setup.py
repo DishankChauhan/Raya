@@ -106,6 +106,54 @@ def run_aml_rules(with_llm=False):
         print(f"❌ Error running AML rules: {e}")
         return {}
 
+def run_llm_analysis_sequentially(limit=3):
+    """
+    Run LLM analysis on flagged transactions one-by-one to prevent timeouts.
+    This simulates a simple queue and is more robust for demo purposes.
+    """
+    print(f"🧠 Running sequential LLM analysis (limit: {limit})...")
+
+    # Get un-analyzed flagged transactions
+    try:
+        response = requests.get(f"{BASE_URL}/api/flagged?status=pending&limit={limit}")
+        if response.status_code != 200:
+            print("   Could not fetch flagged transactions.")
+            return {}
+        
+        flags = response.json().get('flagged_transactions', [])
+        if not flags:
+            print("   No pending transactions to analyze.")
+            return {}
+
+    except Exception as e:
+        print(f"   Error fetching flagged transactions: {e}")
+        return {}
+    
+    completed_analyses = 0
+    failed_analyses = 0
+    
+    for i, flag in enumerate(flags):
+        print(f"   Analyzing flag {i+1}/{len(flags)} (ID: {flag['flag_id'][:8]}...)...")
+        try:
+            payload = {"flagged_transaction_id": flag['flag_id'], "transaction_id": flag['transaction_id']}
+            response = requests.post(f"{BASE_URL}/api/llm/analyze", json=payload, timeout=90) # Increased timeout
+            
+            if response.status_code == 200:
+                print("   ✅ Analysis successful.")
+                completed_analyses += 1
+            else:
+                print(f"   ❌ Analysis failed: {response.json().get('error', 'Unknown error')}")
+                failed_analyses += 1
+
+            time.sleep(5) # Add a delay between requests to avoid rate-limiting
+
+        except requests.exceptions.RequestException as e:
+            print(f"   ❌ Network error during analysis: {e}")
+            failed_analyses += 1
+    
+    print("✅ Sequential LLM analysis finished.")
+    return {'analyses_completed': completed_analyses, 'analyses_failed': failed_analyses}
+
 def run_llm_batch_analysis(batch_limit=5):
     """Run LLM analysis on flagged transactions"""
     print(f"🧠 Running LLM batch analysis (limit: {batch_limit})...")
@@ -345,7 +393,8 @@ def main():
     print("\n3️⃣ Step 3: Run LLM Analysis (if available)")
     if llm_enabled and rule_results.get('flagged_count', 0) > 0:
         time.sleep(1)
-        llm_results = run_llm_batch_analysis(batch_limit=3)
+        # Replaced batch analysis with sequential for more robust demo
+        llm_results = run_llm_analysis_sequentially(limit=3)
     else:
         print("   Skipping LLM analysis (not configured or no flagged transactions)")
     
@@ -366,6 +415,9 @@ def main():
     print(f"   - All Transactions: {BASE_URL}/api/transactions")
     print(f"   - Customers: {BASE_URL}/api/customers")
     
+    print(f"\n⭐ New in Phase 3:")
+    print(f"   - Analyst Dashboard: {BASE_URL}/dashboard")
+
     if llm_enabled:
         print(f"   \n🧠 LLM-Enhanced endpoints:")
         print(f"   - LLM Analysis: {BASE_URL}/api/llm/analyze")
