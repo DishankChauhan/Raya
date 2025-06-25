@@ -11,7 +11,7 @@ class Customer(db.Model):
     id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     name = db.Column(db.String(100), nullable=False)
     email = db.Column(db.String(100), unique=True, nullable=False)
-    phone = db.Column(db.String(20))
+    phone = db.Column(db.String(30))
     address = db.Column(db.Text)
     date_of_birth = db.Column(db.Date)
     account_number = db.Column(db.String(20), unique=True, nullable=False)

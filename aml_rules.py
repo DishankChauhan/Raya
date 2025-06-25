@@ -4,7 +4,19 @@ from sqlalchemy import func, and_
 import re
 
 class AMLRuleEngine:
-    def __init__(self):
+    def __init__(self, enable_llm=False):
+        self.enable_llm = enable_llm
+        self.llm_classifier = None
+        
+        # Initialize LLM classifier if enabled
+        if enable_llm:
+            try:
+                from llm_classifier import LLMRiskClassifier
+                self.llm_classifier = LLMRiskClassifier()
+            except ImportError as e:
+                print(f"Warning: Could not import LLM classifier: {e}")
+                self.enable_llm = False
+        
         self.rules = [
             self.large_cash_withdrawal_rule,
             self.multiple_high_value_transactions_rule,
@@ -18,9 +30,10 @@ class AMLRuleEngine:
             self.cross_border_threshold_rule
         ]
     
-    def run_all_rules(self, transaction_id=None):
-        """Run all AML rules on transactions"""
+    def run_all_rules(self, transaction_id=None, run_llm_analysis=False):
+        """Run all AML rules on transactions with optional LLM analysis"""
         flagged_count = 0
+        llm_analyzed_count = 0
         
         if transaction_id:
             # Run rules on specific transaction
@@ -29,20 +42,90 @@ class AMLRuleEngine:
                 for rule in self.rules:
                     if rule(transaction):
                         flagged_count += 1
+                        
+                # Run LLM analysis on newly flagged transactions
+                if run_llm_analysis and self.enable_llm:
+                    llm_analyzed_count += self._run_llm_analysis_for_transaction(transaction_id)
         else:
-            # Run rules on all unflagged transactions
-            transactions = Transaction.query.filter(
-                ~Transaction.id.in_(
-                    db.session.query(FlaggedTransaction.transaction_id)
-                )
-            ).all()
+            # Run rules on all unflagged transactions (batch mode with limits)
+            # Process in smaller batches to avoid timeouts
+            batch_size = 100
+            offset = 0
             
-            for transaction in transactions:
-                for rule in self.rules:
-                    if rule(transaction):
-                        flagged_count += 1
+            while True:
+                transactions = Transaction.query.filter(
+                    ~Transaction.id.in_(
+                        db.session.query(FlaggedTransaction.transaction_id)
+                    )
+                ).offset(offset).limit(batch_size).all()
+                
+                if not transactions:
+                    break
+                
+                batch_flagged = 0
+                for transaction in transactions:
+                    for rule in self.rules:
+                        if rule(transaction):
+                            batch_flagged += 1
+                
+                flagged_count += batch_flagged
+                offset += batch_size
+                
+                # Limit total processing to prevent timeouts
+                if offset >= 1000:  # Process max 1000 transactions per call
+                    break
+            
+            # Run LLM analysis on recently flagged transactions if enabled
+            if run_llm_analysis and self.enable_llm:
+                llm_analyzed_count = self._run_llm_analysis_batch()
         
-        return flagged_count
+        return {
+            "flagged_count": flagged_count,
+            "llm_analyzed_count": llm_analyzed_count,
+            "llm_enabled": self.enable_llm
+        }
+    
+    def _run_llm_analysis_for_transaction(self, transaction_id):
+        """Run LLM analysis for a specific transaction's flags"""
+        analyzed_count = 0
+        
+        # Get all flagged transactions for this transaction that haven't been LLM analyzed
+        flagged_transactions = FlaggedTransaction.query.filter_by(
+            transaction_id=transaction_id
+        ).filter(
+            FlaggedTransaction.llm_analyzed_at.is_(None)
+        ).all()
+        
+        for flagged_tx in flagged_transactions:
+            try:
+                if self.llm_classifier:
+                    self.llm_classifier.analyze_transaction_risk(transaction_id, flagged_tx.id)
+                    analyzed_count += 1
+            except Exception as e:
+                print(f"Error in LLM analysis for flag {flagged_tx.id}: {e}")
+        
+        return analyzed_count
+    
+    def _run_llm_analysis_batch(self, limit=10):
+        """Run LLM analysis on a batch of recently flagged transactions"""
+        analyzed_count = 0
+        
+        # Get recently flagged transactions that haven't been LLM analyzed
+        recent_flags = FlaggedTransaction.query.filter(
+            FlaggedTransaction.llm_analyzed_at.is_(None)
+        ).order_by(
+            FlaggedTransaction.flagged_at.desc()
+        ).limit(limit).all()
+        
+        for flagged_tx in recent_flags:
+            try:
+                if self.llm_classifier:
+                    self.llm_classifier.analyze_transaction_risk(flagged_tx.transaction_id, flagged_tx.id)
+                    analyzed_count += 1
+            except Exception as e:
+                print(f"Error in LLM analysis for flag {flagged_tx.id}: {e}")
+        
+        return analyzed_count
     
     def flag_transaction(self, transaction, rule_name, description, risk_level, risk_score):
         """Create a flag for a transaction"""
@@ -255,10 +338,30 @@ class AMLRuleEngine:
         return False
     
     def get_flagged_summary(self):
-        """Get summary of flagged transactions"""
+        """Get summary of flagged transactions with LLM analysis stats"""
         summary = db.session.query(
             FlaggedTransaction.risk_level,
             func.count(FlaggedTransaction.id).label('count')
         ).group_by(FlaggedTransaction.risk_level).all()
         
-        return {level: count for level, count in summary} 
+        # Get LLM analysis summary
+        llm_summary = db.session.query(
+            FlaggedTransaction.llm_risk_level,
+            func.count(FlaggedTransaction.id).label('count')
+        ).filter(
+            FlaggedTransaction.llm_risk_level.isnot(None)
+        ).group_by(FlaggedTransaction.llm_risk_level).all()
+        
+        # Get analysis counts
+        total_flagged = FlaggedTransaction.query.count()
+        llm_analyzed = FlaggedTransaction.query.filter(
+            FlaggedTransaction.llm_analyzed_at.isnot(None)
+        ).count()
+        
+        return {
+            "rule_based_flags": {level: count for level, count in summary},
+            "llm_analysis": {level: count for level, count in llm_summary},
+            "total_flagged": total_flagged,
+            "llm_analyzed": llm_analyzed,
+            "llm_coverage": round((llm_analyzed / total_flagged * 100) if total_flagged > 0 else 0, 2)
+        } 

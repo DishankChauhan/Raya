@@ -2,7 +2,7 @@ from flask import Flask, request, jsonify, render_template
 from flask_sqlalchemy import SQLAlchemy
 from flask_migrate import Migrate
 from config import config
-from models import db, Customer, Transaction, FlaggedTransaction, SanctionedEntity
+from models import db, Customer, Transaction, FlaggedTransaction, SanctionedEntity, LLMAuditLog
 from data_generator import DataGenerator
 from aml_rules import AMLRuleEngine
 import os
@@ -19,15 +19,27 @@ def create_app(config_name=None):
     db.init_app(app)
     migrate = Migrate(app, db)
     
-    # Initialize rule engine
-    rule_engine = AMLRuleEngine()
+    # Initialize rule engine with LLM capability
+    enable_llm = bool(app.config.get('OPENAI_API_KEY'))
+    rule_engine = AMLRuleEngine(enable_llm=enable_llm)
+    
+    # Initialize LLM classifier if available
+    llm_classifier = None
+    if enable_llm:
+        try:
+            from llm_classifier import LLMRiskClassifier
+            llm_classifier = LLMRiskClassifier()
+        except ImportError:
+            enable_llm = False
     
     @app.route('/')
     def index():
         return jsonify({
             'message': 'Raya - AI-Powered Suspicious Transaction Detection',
-            'version': '1.0.0',
-            'description': 'Advanced AML monitoring system with intelligent rule-based detection',
+            'version': '2.0.0',
+            'description': 'Advanced AML monitoring system with intelligent rule-based detection and LLM analysis',
+            'phase': 'Phase 2 - LLM Enhanced',
+            'llm_enabled': enable_llm,
             'endpoints': {
                 'flagged_transactions': '/api/flagged',
                 'run_rules': '/api/run-rules',
@@ -35,20 +47,25 @@ def create_app(config_name=None):
                 'transactions': '/api/transactions',
                 'customers': '/api/customers',
                 'statistics': '/api/stats',
-                'available_rules': '/api/rules'
+                'available_rules': '/api/rules',
+                'llm_analysis': '/api/llm/analyze',
+                'transaction_explanation': '/api/transaction/<transaction_id>/explanation',
+                'llm_audit_logs': '/api/llm/audit'
             }
         })
     
     @app.route('/api/flagged', methods=['GET'])
     def get_flagged_transactions():
-        """Get all flagged transactions with filtering options"""
+        """Get all flagged transactions with filtering options and LLM analysis"""
         
         # Query parameters
         risk_level = request.args.get('risk_level')
+        llm_risk_level = request.args.get('llm_risk_level')
         rule_name = request.args.get('rule_name')
         status = request.args.get('status', 'pending')
         limit = request.args.get('limit', 100, type=int)
         offset = request.args.get('offset', 0, type=int)
+        include_llm = request.args.get('include_llm', 'true').lower() == 'true'
         
         # Build query
         query = db.session.query(FlaggedTransaction, Transaction, Customer).join(
@@ -60,6 +77,8 @@ def create_app(config_name=None):
         # Apply filters
         if risk_level:
             query = query.filter(FlaggedTransaction.risk_level == risk_level)
+        if llm_risk_level:
+            query = query.filter(FlaggedTransaction.llm_risk_level == llm_risk_level)
         if rule_name:
             query = query.filter(FlaggedTransaction.rule_name == rule_name)
         if status:
@@ -70,7 +89,7 @@ def create_app(config_name=None):
         
         flagged_transactions = []
         for flag, transaction, customer in results:
-            flagged_transactions.append({
+            transaction_data = {
                 'flag_id': str(flag.id),
                 'transaction_id': str(transaction.id),
                 'rule_name': flag.rule_name,
@@ -95,33 +114,51 @@ def create_app(config_name=None):
                     'country_code': customer.country_code,
                     'risk_score': customer.risk_score
                 }
-            })
+            }
+            
+            # Include LLM analysis if requested and available
+            if include_llm and flag.llm_analyzed_at:
+                transaction_data['llm_analysis'] = {
+                    'risk_level': flag.llm_risk_level,
+                    'explanation': flag.llm_explanation,
+                    'suggested_action': flag.llm_suggested_action,
+                    'confidence_score': flag.llm_confidence_score,
+                    'analyzed_at': flag.llm_analyzed_at.isoformat(),
+                    'model_used': flag.llm_model_used
+                }
+            
+            flagged_transactions.append(transaction_data)
         
         return jsonify({
             'flagged_transactions': flagged_transactions,
             'total_results': len(flagged_transactions),
             'filters_applied': {
                 'risk_level': risk_level,
+                'llm_risk_level': llm_risk_level,
                 'rule_name': rule_name,
                 'status': status
-            }
+            },
+            'llm_enabled': enable_llm
         })
     
     @app.route('/api/run-rules', methods=['POST'])
     def run_aml_rules():
-        """Run AML rules on transactions"""
+        """Run AML rules on transactions with optional LLM analysis"""
         
         data = request.get_json() or {}
         transaction_id = data.get('transaction_id')
+        run_llm_analysis = data.get('run_llm_analysis', False)
+        batch_size = data.get('batch_size', 100)  # Limit batch size to prevent timeouts
         
         try:
-            flagged_count = rule_engine.run_all_rules(transaction_id)
+            result = rule_engine.run_all_rules(transaction_id, run_llm_analysis)
             
             return jsonify({
                 'success': True,
                 'message': f'AML rules executed successfully',
-                'flagged_transactions': flagged_count,
-                'timestamp': datetime.utcnow().isoformat()
+                'results': result,
+                'timestamp': datetime.utcnow().isoformat(),
+                'llm_enabled': enable_llm
             })
         
         except Exception as e:
@@ -130,6 +167,158 @@ def create_app(config_name=None):
                 'error': str(e)
             }), 500
     
+    @app.route('/api/llm/analyze', methods=['POST'])
+    def run_llm_analysis():
+        """Run LLM analysis on flagged transactions"""
+        
+        if not enable_llm or not llm_classifier:
+            return jsonify({
+                'success': False,
+                'error': 'LLM analysis is not enabled or configured'
+            }), 400
+        
+        data = request.get_json() or {}
+        transaction_id = data.get('transaction_id')
+        flagged_transaction_id = data.get('flagged_transaction_id')
+        batch_limit = data.get('batch_limit', 5)
+        
+        try:
+            if transaction_id and flagged_transaction_id:
+                # Analyze specific flagged transaction
+                result = llm_classifier.analyze_transaction_risk(transaction_id, flagged_transaction_id)
+                return jsonify({
+                    'success': True,
+                    'analysis_result': result,
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+            
+            elif transaction_id:
+                # Analyze all flags for a specific transaction
+                flagged_transactions = FlaggedTransaction.query.filter_by(
+                    transaction_id=transaction_id
+                ).filter(FlaggedTransaction.llm_analyzed_at.is_(None)).all()
+                
+                results = []
+                for flag in flagged_transactions:
+                    result = llm_classifier.analyze_transaction_risk(transaction_id, flag.id)
+                    results.append(result)
+                
+                return jsonify({
+                    'success': True,
+                    'analyses_completed': len(results),
+                    'results': results,
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+            
+            else:
+                # Batch analysis of recent flagged transactions
+                recent_flags = FlaggedTransaction.query.filter(
+                    FlaggedTransaction.llm_analyzed_at.is_(None)
+                ).order_by(FlaggedTransaction.flagged_at.desc()).limit(batch_limit).all()
+                
+                results = []
+                for flag in recent_flags:
+                    try:
+                        result = llm_classifier.analyze_transaction_risk(flag.transaction_id, flag.id)
+                        results.append(result)
+                    except Exception as e:
+                        results.append({'error': str(e), 'flag_id': flag.id})
+                
+                return jsonify({
+                    'success': True,
+                    'analyses_completed': len([r for r in results if 'error' not in r]),
+                    'analyses_failed': len([r for r in results if 'error' in r]),
+                    'results': results,
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+        
+        except Exception as e:
+            return jsonify({
+                'success': False,
+                'error': str(e)
+            }), 500
+
+    @app.route('/api/transaction/<transaction_id>/explanation', methods=['GET'])
+    def get_transaction_explanation(transaction_id):
+        """Get comprehensive explanation for a specific transaction"""
+        
+        if not enable_llm or not llm_classifier:
+            return jsonify({
+                'success': False,
+                'error': 'LLM analysis is not enabled or configured'
+            }), 400
+        
+        try:
+            # Get comprehensive analysis summary
+            summary = llm_classifier.get_analysis_summary(transaction_id)
+            
+            if 'error' in summary:
+                return jsonify(summary), 404
+            
+            return jsonify({
+                'success': True,
+                'explanation': summary,
+                'timestamp': datetime.utcnow().isoformat()
+            })
+        
+        except Exception as e:
+            return jsonify({
+                'success': False,
+                'error': str(e)
+            }), 500
+
+    @app.route('/api/llm/audit', methods=['GET'])
+    def get_llm_audit_logs():
+        """Get LLM audit logs for transparency and compliance"""
+        
+        # Query parameters
+        transaction_id = request.args.get('transaction_id')
+        status = request.args.get('status')
+        limit = request.args.get('limit', 50, type=int)
+        offset = request.args.get('offset', 0, type=int)
+        
+        query = LLMAuditLog.query
+        
+        if transaction_id:
+            query = query.filter(LLMAuditLog.transaction_id == transaction_id)
+        if status:
+            query = query.filter(LLMAuditLog.status == status)
+        
+        logs = query.order_by(LLMAuditLog.created_at.desc()).offset(offset).limit(limit).all()
+        
+        audit_logs = []
+        for log in logs:
+            audit_logs.append({
+                'id': str(log.id),
+                'transaction_id': str(log.transaction_id),
+                'flagged_transaction_id': str(log.flagged_transaction_id) if log.flagged_transaction_id else None,
+                'model_used': log.model_used,
+                'status': log.status,
+                'tokens_used': log.tokens_used,
+                'response_time_ms': log.response_time_ms,
+                'cost_estimate': log.cost_estimate,
+                'error_message': log.error_message,
+                'created_at': log.created_at.isoformat()
+            })
+        
+        # Calculate summary statistics
+        total_logs = LLMAuditLog.query.count()
+        success_count = LLMAuditLog.query.filter_by(status='success').count()
+        error_count = LLMAuditLog.query.filter_by(status='error').count()
+        total_cost = db.session.query(db.func.sum(LLMAuditLog.cost_estimate)).scalar() or 0
+        
+        return jsonify({
+            'audit_logs': audit_logs,
+            'total_results': len(audit_logs),
+            'summary': {
+                'total_requests': total_logs,
+                'successful_requests': success_count,
+                'failed_requests': error_count,
+                'success_rate': round((success_count / total_logs * 100) if total_logs > 0 else 0, 2),
+                'total_estimated_cost': round(total_cost, 4)
+            }
+        })
+
     @app.route('/api/init-db', methods=['POST'])
     def init_database():
         """Initialize database tables"""
@@ -255,14 +444,14 @@ def create_app(config_name=None):
     
     @app.route('/api/stats', methods=['GET'])
     def get_statistics():
-        """Get AML system statistics"""
+        """Get AML system statistics with LLM analysis metrics"""
         
         # Basic counts
         total_customers = Customer.query.count()
         total_transactions = Transaction.query.count()
         total_flagged = FlaggedTransaction.query.count()
         
-        # Risk level breakdown
+        # Enhanced flagged summary with LLM stats
         flagged_summary = rule_engine.get_flagged_summary()
         
         # Recent activity (last 7 days)
@@ -280,6 +469,22 @@ def create_app(config_name=None):
             db.func.count(FlaggedTransaction.id).label('count')
         ).group_by(FlaggedTransaction.rule_name).order_by(db.text('count DESC')).limit(5).all()
         
+        # LLM statistics
+        llm_stats = {}
+        if enable_llm:
+            llm_logs_count = LLMAuditLog.query.count()
+            llm_success_count = LLMAuditLog.query.filter_by(status='success').count()
+            llm_total_cost = db.session.query(db.func.sum(LLMAuditLog.cost_estimate)).scalar() or 0
+            
+            llm_stats = {
+                'total_llm_requests': llm_logs_count,
+                'successful_requests': llm_success_count,
+                'success_rate': round((llm_success_count / llm_logs_count * 100) if llm_logs_count > 0 else 0, 2),
+                'total_cost_estimate': round(llm_total_cost, 4),
+                'llm_analyzed_transactions': flagged_summary.get('llm_analyzed', 0),
+                'llm_coverage': flagged_summary.get('llm_coverage', 0)
+            }
+        
         return jsonify({
             'overview': {
                 'total_customers': total_customers,
@@ -292,7 +497,9 @@ def create_app(config_name=None):
                 'transactions_last_7_days': recent_transactions,
                 'flagged_last_7_days': recent_flagged
             },
-            'top_triggered_rules': [{'rule': rule, 'count': count} for rule, count in top_rules]
+            'top_triggered_rules': [{'rule': rule, 'count': count} for rule, count in top_rules],
+            'llm_analysis': llm_stats,
+            'llm_enabled': enable_llm
         })
     
     @app.route('/api/rules', methods=['GET'])
@@ -346,7 +553,8 @@ def create_app(config_name=None):
         
         return jsonify({
             'available_rules': rules_info,
-            'total_rules': len(rules_info)
+            'total_rules': len(rules_info),
+            'llm_enhancement': 'Available for detailed risk analysis' if enable_llm else 'Not configured'
         })
     
     return app
@@ -357,4 +565,4 @@ app = create_app()
 if __name__ == '__main__':
     with app.app_context():
         db.create_all()
-    app.run(host='0.0.0.0', port=5000, debug=True) 
+    app.run(host='0.0.0.0', port=8080, debug=True) 

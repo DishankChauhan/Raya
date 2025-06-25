@@ -21,13 +21,16 @@ services:
       - "5001:5000"
     environment:
       - DATABASE_URL=postgresql://raya_user:raya_password@db:5432/raya_db
-      - FLASK_ENV=development
+      - FLASK_ENV=production
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
     depends_on:
       db:
         condition: service_healthy
     volumes:
       - .:/app
     working_dir: /app
+    env_file:
+      - .env
 
 volumes:
   postgres_data: 
